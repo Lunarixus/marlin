@@ -2566,10 +2566,12 @@ static inline int update_cfs_rq_load_avg(u64 now, struct cfs_rq *cfs_rq,
 	return decayed || removed;
 }
 
-static inline unsigned long task_util_est(struct task_struct *p)
-{
-	return p->se.avg.util_est;
-}
+/*
+ * Optional action to be done while updating the load average
+ */
+#define UPDATE_TG	0x1
+#define SKIP_AGE_LOAD	0x2
+#define SKIP_CPUFREQ	0x4
 
 /* Update task and its cfs_rq load average */
 static inline void update_load_avg(struct sched_entity *se, int update_tg)
@@ -2585,6 +2587,9 @@ static inline void update_load_avg(struct sched_entity *se, int update_tg)
 	__update_load_avg(now, cpu, &se->avg,
 			  se->on_rq * scale_load_down(se->load.weight),
 			  cfs_rq->curr == se, NULL);
+
+	decayed  = update_cfs_rq_load_avg(now, cfs_rq, !(flags & SKIP_CPUFREQ));
+	decayed |= propagate_entity_load_avg(se);
 
 	if (update_cfs_rq_load_avg(now, cfs_rq, true) && update_tg)
 		update_tg_load_avg(cfs_rq, 0);
@@ -2764,6 +2769,11 @@ static inline void update_load_avg(struct sched_entity *se, int update_tg)
 	cpufreq_update_util(rq_of(cfs_rq_of(se)), 0);
 }
 
+#define UPDATE_TG	0x0
+#define SKIP_AGE_LOAD	0x0
+#define SKIP_CPUFREQ	0x3
+
+static inline void update_load_avg(struct sched_entity *se, int not_used1){}
 static inline void
 enqueue_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) {}
 static inline void
@@ -2977,10 +2987,27 @@ static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq);
 static void
 dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
+	int update_flags;
+
 	/*
 	 * Update run-time statistics of the 'current'.
 	 */
 	update_curr(cfs_rq);
+
+	/*
+	 * When dequeuing a sched_entity, we must:
+	 *   - Update loads to have both entity and cfs_rq synced with now.
+	 *   - Substract its load from the cfs_rq->runnable_avg.
+	 *   - Substract its previous weight from cfs_rq->load.weight.
+	 *   - For group entity, update its weight to reflect the new share
+	 *     of its group cfs_rq.
+	 */
+	update_flags = UPDATE_TG;
+
+	if (flags & DEQUEUE_IDLE)
+		update_flags |= SKIP_CPUFREQ;
+
+	update_load_avg(se, update_flags);
 	dequeue_entity_load_avg(cfs_rq, se);
 
 	update_stats_dequeue(cfs_rq, se);
@@ -4204,6 +4231,9 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	struct sched_entity *se = &p->se;
 	int task_sleep = flags & DEQUEUE_SLEEP;
 
+	if (task_sleep && rq->nr_running == 1)
+		flags |= DEQUEUE_IDLE;
+
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
 		dequeue_entity(cfs_rq, se, flags);
@@ -4243,8 +4273,8 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 		if (cfs_rq_throttled(cfs_rq))
 			break;
 
-		update_load_avg(se, 1);
-		update_cfs_shares(cfs_rq);
+		update_load_avg(se, UPDATE_TG | (flags & DEQUEUE_IDLE));
+		update_cfs_shares(se);
 	}
 
 	if (!se)
