@@ -4596,7 +4596,7 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 			break;
 
 		update_load_avg(se, UPDATE_TG | (flags & DEQUEUE_IDLE));
-		update_cfs_shares(se);
+		update_cfs_shares(cfs_rq);
 	}
 
 	if (!se)
