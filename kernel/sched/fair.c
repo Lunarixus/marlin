@@ -2516,6 +2516,26 @@ __update_load_avg(u64 now, int cpu, struct sched_avg *sa,
 	return decayed;
 }
 
+/*
+ * Signed add and clamp on underflow.
+ *
+ * Explicitly do a load-store to ensure the intermediate value never hits
+ * memory. This allows lockless observations without ever seeing the negative
+ * values.
+ */
+#define add_positive(_ptr, _val) do {                           \
+	typeof(_ptr) ptr = (_ptr);                              \
+	typeof(_val) val = (_val);                              \
+	typeof(*ptr) res, var = READ_ONCE(*ptr);                \
+								\
+	res = var + val;                                        \
+								\
+	if (val < 0 && res > var)                               \
+		res = 0;                                        \
+								\
+	WRITE_ONCE(*ptr, res);                                  \
+} while (0)
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
 /*
  * Updating tg's load_avg is necessary before update_cfs_share (which is done)
@@ -2583,8 +2603,167 @@ void set_task_rq_fair(struct sched_entity *se,
 		se->avg.last_update_time = n_last_update_time;
 	}
 }
+
+/* Take into account change of utilization of a child task group */
+static inline void
+update_tg_cfs_util(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	struct cfs_rq *gcfs_rq = group_cfs_rq(se);
+	long delta = gcfs_rq->avg.util_avg - se->avg.util_avg;
+
+	/* Nothing to update */
+	if (!delta)
+		return;
+
+	/* Set new sched_entity's utilization */
+	se->avg.util_avg = gcfs_rq->avg.util_avg;
+	se->avg.util_sum = se->avg.util_avg * LOAD_AVG_MAX;
+
+	/* Update parent cfs_rq utilization */
+	add_positive(&cfs_rq->avg.util_avg, delta);
+	cfs_rq->avg.util_sum = cfs_rq->avg.util_avg * LOAD_AVG_MAX;
+}
+
+/* Take into account change of load of a child task group */
+static inline void
+update_tg_cfs_load(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	struct cfs_rq *gcfs_rq = group_cfs_rq(se);
+	long delta, load = gcfs_rq->avg.load_avg;
+
+	/*
+	 * If the load of group cfs_rq is null, the load of the
+	 * sched_entity will also be null so we can skip the formula
+	 */
+	if (load) {
+		long tg_load;
+
+		/* Get tg's load and ensure tg_load > 0 */
+		tg_load = atomic_long_read(&gcfs_rq->tg->load_avg) + 1;
+
+		/* Ensure tg_load >= load and updated with current load*/
+		tg_load -= gcfs_rq->tg_load_avg_contrib;
+		tg_load += load;
+
+		/*
+		 * We need to compute a correction term in the case that the
+		 * task group is consuming more CPU than a task of equal
+		 * weight. A task with a weight equals to tg->shares will have
+		 * a load less or equal to scale_load_down(tg->shares).
+		 * Similarly, the sched_entities that represent the task group
+		 * at parent level, can't have a load higher than
+		 * scale_load_down(tg->shares). And the Sum of sched_entities'
+		 * load must be <= scale_load_down(tg->shares).
+		 */
+		if (tg_load > scale_load_down(gcfs_rq->tg->shares)) {
+			/* scale gcfs_rq's load into tg's shares*/
+			load *= scale_load_down(gcfs_rq->tg->shares);
+			load /= tg_load;
+		}
+	}
+
+	delta = load - se->avg.load_avg;
+
+	/* Nothing to update */
+	if (!delta)
+		return;
+
+	/* Set new sched_entity's load */
+	se->avg.load_avg = load;
+	se->avg.load_sum = se->avg.load_avg * LOAD_AVG_MAX;
+
+	/* Update parent cfs_rq load */
+	add_positive(&cfs_rq->avg.load_avg, delta);
+	cfs_rq->avg.load_sum = cfs_rq->avg.load_avg * LOAD_AVG_MAX;
+
+	/*
+	 * If the sched_entity is already enqueued, we also have to update the
+	 * runnable load avg.
+	 */
+	if (se->on_rq) {
+		/* Update parent cfs_rq runnable_load_avg */
+		add_positive(&cfs_rq->runnable_load_avg, delta);
+		cfs_rq->runnable_load_sum = cfs_rq->runnable_load_avg * LOAD_AVG_MAX;
+	}
+}
+
+static inline void set_tg_cfs_propagate(struct cfs_rq *cfs_rq)
+{
+	cfs_rq->propagate_avg = 1;
+}
+
+static inline int test_and_clear_tg_cfs_propagate(struct sched_entity *se)
+{
+	struct cfs_rq *cfs_rq = group_cfs_rq(se);
+
+	if (!cfs_rq->propagate_avg)
+		return 0;
+
+	cfs_rq->propagate_avg = 0;
+	return 1;
+}
+
+/* Update task and its cfs_rq load average */
+static inline int propagate_entity_load_avg(struct sched_entity *se)
+{
+	struct cfs_rq *cfs_rq;
+
+	if (entity_is_task(se))
+		return 0;
+
+	if (!test_and_clear_tg_cfs_propagate(se))
+		return 0;
+
+	cfs_rq = cfs_rq_of(se);
+
+	set_tg_cfs_propagate(cfs_rq);
+
+	update_tg_cfs_util(cfs_rq, se);
+	update_tg_cfs_load(cfs_rq, se);
+
+	return 1;
+}
+
+/*
+ * Check if we need to update the load and the utilization of a blocked
+ * group_entity:
+ */
+static inline bool skip_blocked_update(struct sched_entity *se)
+{
+	struct cfs_rq *gcfs_rq = group_cfs_rq(se);
+
+	/*
+	 * If sched_entity still have not zero load or utilization, we have to
+	 * decay it:
+	 */
+	if (se->avg.load_avg || se->avg.util_avg)
+		return false;
+
+	/*
+	 * If there is a pending propagation, we have to update the load and
+	 * the utilization of the sched_entity:
+	 */
+	if (gcfs_rq->propagate_avg)
+		return false;
+
+	/*
+	 * Otherwise, the load and the utilization of the sched_entity is
+	 * already zero and there is no pending propagation, so it will be a
+	 * waste of time to try to decay it:
+	 */
+	return true;
+}
+
 #else /* CONFIG_FAIR_GROUP_SCHED */
 static inline void update_tg_load_avg(struct cfs_rq *cfs_rq, int force) {}
+
+static inline int propagate_entity_load_avg(struct sched_entity *se)
+{
+	return 0;
+}
+
+static inline void set_tg_cfs_propagate(struct cfs_rq *cfs_rq) {}
+
 #endif /* CONFIG_FAIR_GROUP_SCHED */
 
 static inline void cfs_rq_util_change(struct cfs_rq *cfs_rq)
