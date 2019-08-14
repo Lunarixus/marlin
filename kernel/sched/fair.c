@@ -5609,7 +5609,7 @@ static inline bool task_fits_spare(struct task_struct *p, int cpu)
 
 static bool cpu_overutilized(int cpu)
 {
-	return (capacity_of(cpu) * 1024) < (cpu_util(cpu) * capacity_margin);
+	return (capacity_of(cpu) * 1024) < (cpu_util(cpu, false) * capacity_margin);
 }
 
 #ifdef CONFIG_SCHED_TUNE
@@ -5674,7 +5674,7 @@ schedtune_task_margin(struct task_struct *task)
 	if (boost == 0)
 		return 0;
 
-	util = task_util(task);
+	util = task_util(task, false);
 	margin = schedtune_margin(util, boost);
 
 	return margin;
@@ -5699,7 +5699,7 @@ schedtune_task_margin(struct task_struct *task)
 unsigned long
 boosted_cpu_util(int cpu)
 {
-	unsigned long util = cpu_util(cpu);
+	unsigned long util = cpu_util(cpu, false);
 	long margin = schedtune_cpu_margin(util, cpu);
 
 	trace_sched_boost_cpu(cpu, util, margin);
