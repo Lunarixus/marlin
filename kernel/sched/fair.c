@@ -4603,7 +4603,7 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 		sub_nr_running(rq, 1);
 
 #ifdef CONFIG_SMP
-	if (!se)
+	if (!se) {
 		walt_dec_cumulative_runnable_avg(rq, p);
 
 		/*
@@ -4620,6 +4620,7 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 			else if (sched_freq())
 				update_capacity_of(cpu_of(rq), false);
 		}
+	}
 
 	/* Get the top level CFS RQ for the task CPU */
 	cfs_rq = &(task_rq(p)->cfs);
